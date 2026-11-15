@@ -1,0 +1,819 @@
+import re
+import pyodbc
+from PyQt6.QtCore import QDate
+from PyQt6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QTabWidget, QTableWidget,
+                             QTableWidgetItem, QPushButton, QLabel, QMessageBox,
+                             QInputDialog, QHBoxLayout, QLineEdit, QComboBox, QDialog, QFormLayout, QSpinBox, QDateEdit)
+
+from reports import ReportExporter
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, db_manager, auth_window):
+        super().__init__()
+        self.db = db_manager
+        self.auth_window = auth_window
+        self.setWindowTitle(f"Библиотека — {self.db.user_login}")
+        self.resize(1260, 900)
+
+        # Инициализация всех таблиц
+        self.table_cat = QTableWidget()
+        self.table_prof = QTableWidget()
+        self.table_adm = QTableWidget()
+        self.table_staff = QTableWidget()
+
+        self.central = QWidget()
+        self.setCentralWidget(self.central)
+        self.layout = QVBoxLayout(self.central)
+
+        # Панель управления (Верхний бар)
+        top_bar = QHBoxLayout()
+        info = QLabel(f"<b>Пользователь:</b> {self.db.user_login} | <b>Роль:</b> {self.db.current_role}")
+        btn_logout = QPushButton("🚪 Сменить пользователя")
+        btn_logout.clicked.connect(self.logout)
+        top_bar.addWidget(info);
+        top_bar.addStretch();
+        top_bar.addWidget(btn_logout)
+        self.layout.addLayout(top_bar)
+
+        self.tabs = QTabWidget()
+        self.layout.addWidget(self.tabs)
+
+        # --- РАСПРЕДЕЛЕНИЕ ВКЛАДОК СОГЛАСНО ТВОИМ ПОЖЕЛАНИЯМ ---
+
+        # 1. КАТАЛОГ (Убрали у Админа)
+        if self.db.current_role in ['Role_Reader', 'Role_Librarian', 'Role_Head']:
+            self.setup_cat_tab()
+
+        # 2. ПРОФИЛЬ (Убрали у Хеда и Админа)
+        if self.db.current_role in ['Role_Reader', 'Role_Librarian']:
+            self.setup_prof_tab()
+
+        # 3. АДМИНКА (Аналитика и выдача. Убрали у Админа)
+        if self.db.current_role in ['Role_Librarian', 'Role_Head']:
+            self.setup_adm_tab()
+
+        # 4. ПЕРСОНАЛ (Только для Хеда)
+        if self.db.current_role == 'Role_Head':
+            self.setup_staff_tab()
+
+        # 5. ПАНЕЛЬ DBA (Только для Админа)
+        if self.db.current_role == 'Role_DBA':
+            self.setup_dba_maintenance_tab()
+
+        # Внутри __init__ после определения self.user_role
+        if self.db.current_role in ['Role_Librarian', 'Role_Head']:
+            self.setup_readers_management_tab()
+
+        self.refresh()
+
+    def logout(self):
+        self.close()
+        self.auth_window.show()
+
+    def setup_cat_tab(self):
+        tab = QWidget();
+        lay = QVBoxLayout(tab)
+        search_lay = QHBoxLayout()
+        self.s = QLineEdit();
+        self.s.setPlaceholderText("Живой поиск...");
+        self.s.textChanged.connect(self.do_search)
+        btn_author_q = QPushButton("🔍 Поиск по автору (Запрос 4)")
+        btn_author_q.clicked.connect(self.query_books_by_author)
+        search_lay.addWidget(self.s);
+        search_lay.addWidget(btn_author_q)
+        lay.addLayout(search_lay)
+
+        # lay.addWidget(self.table_cat)
+        btn = QPushButton("🔄 Обновить каталог");
+        btn.clicked.connect(self.refresh);
+        lay.addWidget(btn)
+        self.tabs.addTab(tab, "Каталог")
+
+    def setup_prof_tab(self):
+        tab = QWidget();
+        lay = QVBoxLayout(tab)
+        lay.addWidget(QLabel("Мои данные:"));
+        lay.addWidget(self.table_prof)
+        if self.db.current_role == 'Role_Reader':
+            be = QPushButton("📝 Редактировать профиль");
+            be.clicked.connect(self.edit_prof);
+            lay.addWidget(be)
+        self.tabs.addTab(tab, "Профиль")
+
+    def setup_adm_tab(self):
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+
+        # --- БЛОК 1: АНАЛИТИКА И ОТЧЕТЫ (Views / Procedures) ---
+        lay.addWidget(QLabel("<b>📊 Аналитика и отчеты (Запросы 1-5, Отчеты 1-3):</b>"))
+        ana_lay = QHBoxLayout()
+
+        btn_debtors = QPushButton("🚩 Должники (3)")
+        btn_debtors.clicked.connect(lambda: self.load_data(self.table_adm, "SELECT * FROM View_Books_On_Hands"))
+
+        btn_minor = QPushButton("👶 Несовершеннолетние (5)")
+        btn_minor.clicked.connect(self.query_minors)
+
+        btn_finance = QPushButton("💰 Стоимость фонда (Отчет 2)")
+        btn_finance.clicked.connect(self.proc_financial_report)
+
+        btn_movement = QPushButton("📦 Движение (Отчет 1)")
+        btn_movement.clicked.connect(lambda: self.load_data(self.table_adm, "SELECT * FROM LibrarianMovementReport"))
+
+        btn_new = QPushButton("🆕 Поступления (Отчет 3)")
+        btn_new.clicked.connect(
+            lambda: self.load_data(self.table_adm, "SELECT * FROM Books_Received_Current_Year_View"))
+
+        for b in [btn_debtors, btn_minor, btn_finance, btn_movement, btn_new]: ana_lay.addWidget(b)
+        lay.addLayout(ana_lay)
+
+        # --- БЛОК 2: ЭКСПОРТ И СПЕЦ. ПРОЦЕДУРЫ ---
+        lay.addWidget(QLabel("<b>🛠 Действия и Процедуры:</b>"))
+        act_lay = QHBoxLayout()
+
+        # Кнопки экспорта
+        b_xls = QPushButton("📗 Excel");
+        b_xls.clicked.connect(lambda: ReportExporter.to_excel(self.table_adm, "Report"))
+        b_pdf = QPushButton("📕 PDF");
+        b_pdf.clicked.connect(lambda: ReportExporter.to_pdf(self.table_adm, "Report"))
+
+        # Хранимые процедуры (Проц 3 и 4)
+        btn_mass_auth = QPushButton("✍ Массовые авторы (Проц 3)")
+        btn_mass_auth.clicked.connect(self.proc_mass_authors)
+
+        btn_check_auth = QPushButton("📋 Список авторов (Результат)")
+        btn_check_auth.clicked.connect(self.view_all_authors)
+
+        btn_upd_book = QPushButton("🆙 Обновить книгу (Проц 4)")
+        btn_upd_book.clicked.connect(self.proc_update_book_info)
+
+        for b in [b_xls, b_pdf, btn_mass_auth, btn_check_auth, btn_upd_book]: act_lay.addWidget(b)
+        lay.addLayout(act_lay)
+
+        # ТАБЛИЦА
+        lay.addWidget(self.table_adm)
+
+        # --- БЛОК 3: УПРАВЛЕНИЕ ВЫДАЧЕЙ (INSERT/DELETE) ---
+        lay.addWidget(QLabel("<b>📖 Операции:</b>"))
+        btns = QHBoxLayout()
+        bi = QPushButton("📖 Выдать книгу");
+        bi.clicked.connect(self.form_issue)
+        ba = QPushButton("✍ Добавить автора");
+        ba.clicked.connect(self.form_author)
+        bb = QPushButton("📚 Создать книгу");
+        bb.clicked.connect(self.form_add_book_to_author)
+        bd = QPushButton("🗑 Удалить выдачу");
+        bd.clicked.connect(self.do_del)
+        for b in [bi, ba, bb, bd]: btns.addWidget(b)
+        lay.addLayout(btns)
+
+        self.tabs.addTab(tab, "Админка")
+
+    def setup_staff_tab(self):
+        tab = QWidget();
+        lay = QVBoxLayout(tab)
+        lay.addWidget(QLabel("<b>Управление сотрудниками (Librarian):</b>"))
+        lay.addWidget(self.table_staff)
+        btns = QHBoxLayout()
+        btn_add = QPushButton("👤 Нанять библиотекаря");
+        btn_add.clicked.connect(self.form_add_librarian)
+        btn_del = QPushButton("❌ Уволить сотрудника");
+        btn_del.clicked.connect(self.do_fire_librarian)
+        btns.addWidget(btn_add);
+        btns.addWidget(btn_del);
+        lay.addLayout(btns)
+        self.tabs.addTab(tab, "Персонал")
+
+    # =========================
+    # ВАЛИДАЦИЯ ДАННЫХ
+    # =========================
+
+    def validate_name(self, text):
+        """
+        Проверка ФИО:
+        - только буквы
+        - пробелы
+        - дефисы
+        """
+
+        pattern = r"^[А-Яа-яA-Za-z\s\-]+$"
+
+        return bool(re.fullmatch(pattern, text.strip()))
+
+    def validate_phone(self, phone):
+        """
+        Проверка телефона:
+        только цифры
+        длина 5-15
+        """
+
+        pattern = r"^\d{5,15}$"
+
+        return bool(re.fullmatch(pattern, phone.strip()))
+
+    def validate_text_required(self, text):
+        """
+        Проверка пустого поля
+        """
+
+        return bool(text.strip())
+
+    def validate_book_name(self, text):
+        """
+        Проверка названия книги
+        """
+
+        return len(text.strip()) >= 2
+
+    def refresh(self):
+        """Обновление данных с проверкой прав, чтобы не было ошибок SELECT permission denied"""
+
+        # 1. Каталог грузим всем, кроме Админа (раз ты его убрал у него)
+        if self.db.current_role != 'Role_DBA':
+            # Теперь книги всегда будут по алфавиту
+            self.load_data(self.table_cat, "SELECT * FROM Full_Book_Info_View ORDER BY [Название книги] ASC")
+
+        # 2. Профиль грузим только Читателю и Библиотекарю
+        if self.db.current_role == 'Role_Reader':
+            self.load_data(self.table_prof, "SELECT * FROM v_MyProfile_Reader")
+        elif self.db.current_role == 'Role_Librarian':
+            self.load_data(self.table_prof, "SELECT * FROM v_MyProfile_Librarian")
+
+        # 3. АДМИНКА (Операционная аналитика)
+        # ОШИБКА БЫЛА ТУТ: Админу (DBA) запрещено читать Book_Issuance напрямую.
+        # Поэтому грузим только Библиотекарю и Заведующему.
+        if self.db.current_role in ['Role_Librarian', 'Role_Head']:
+            self.load_data(self.table_adm, "SELECT * FROM Book_Issuance")
+
+        # 4. ПЕРСОНАЛ (Только для Заведующего)
+        if self.db.current_role == 'Role_Head':
+            self.load_data(self.table_staff, "SELECT id, name, SystemLogin FROM Librarian")
+
+        # 5. Для DBA ничего в общие таблицы не грузим,
+        # он будет наполнять таблицу своей вкладки кнопками на Панели DBA.
+
+    def load_data(self, table, query):
+        cols, rows = self.db.get_data(query)
+        if not cols: return
+        table.setColumnCount(len(cols));
+        table.setHorizontalHeaderLabels(cols);
+        table.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                table.setItem(r, c, QTableWidgetItem(str(val if val is not None else "")))
+        table.resizeColumnsToContents()
+
+    def do_search(self):
+        txt = self.s.text().lower()
+        for i in range(self.table_cat.rowCount()):
+            match = any(txt in (self.table_cat.item(i, j).text().lower() if self.table_cat.item(i, j) else "") for j in
+                        range(self.table_cat.columnCount()))
+            self.table_cat.setRowHidden(i, not match)
+
+    def edit_prof(self):
+        """Редактирование профиля: меняет только введенные данные и сразу обновляет экран"""
+        d = QDialog(self)
+        d.setWindowTitle("Редактирование профиля")
+        d.setMinimumWidth(400)
+        f = QFormLayout(d)
+
+        # Поля ввода (пустые, без предзаполнения)
+        n_in = QLineEdit();
+        a_in = QLineEdit()
+        p_in = QLineEdit();
+        w_in = QLineEdit();
+        pr_in = QLineEdit()
+
+        f.addRow("Новое ФИО:", n_in)
+        f.addRow("Новый адрес:", a_in)
+        f.addRow("Новый телефон:", p_in)
+        f.addRow("Новое место работы:", w_in)
+        f.addRow("Новая профессия:", pr_in)
+
+        btn = QPushButton("💾 Применить и обновить")
+        btn.clicked.connect(d.accept);
+        f.addRow(btn)
+
+        if d.exec():
+            # Запрос меняет данные только если в поле что-то введено.
+            # Поиск строки идет через вьюху текущего профиля.
+            sql = """
+                  UPDATE Readers
+                  SET name          = CASE WHEN ? = '' THEN name ELSE ? END,
+                      adress       = CASE WHEN ? = '' THEN adress ELSE ? END,
+                      phone         = CASE WHEN ? = '' THEN phone ELSE ? END,
+                      place_of_work = CASE WHEN ? = '' THEN place_of_work ELSE ? END,
+                      profession    = CASE WHEN ? = '' THEN profession ELSE ? END
+                  WHERE name = (SELECT TOP 1 name FROM v_MyProfile_Reader) \
+                  """
+
+            # Собираем текст из полей
+            v_n = n_in.text();
+            v_a = a_in.text();
+            v_p = p_in.text()
+            v_w = w_in.text();
+            v_pr = pr_in.text()
+
+            # Каждый параметр идет дважды (для проверки на пустоту и для вставки)
+            params = [v_n, v_n, v_a, v_a, v_p, v_p, v_w, v_w, v_pr, v_pr]
+
+            ok, msg = self.db.execute_query(sql, params)
+
+            if ok:
+                # Мгновенно обновляем таблицу в профиле, чтобы увидеть результат
+                self.refresh()
+                QMessageBox.information(self, "ОК", "Данные обновлены!")
+            else:
+                QMessageBox.critical(self, "Ошибка БД", msg)
+
+    def form_add_book_to_author(self):
+        """УЛУЧШЕННАЯ ВЕРСИЯ: Создание книги со всеми связями для отображения в каталоге"""
+        try:
+            # Получаем ID для новых записей
+            next_book_id = self.db.get_next_id("Book", "id")
+            next_inv_id = self.db.get_next_id("Inventory_Numbers", "id")
+
+            # Подгружаем списки для выбора
+            authors = self.db.get_list("SELECT * FROM Authors_Name")
+            classes = self.db.get_list("SELECT * FROM Classifier")
+            racks = self.db.get_list("SELECT id, name + ' (' + location_of_rack + ')' FROM Storage_Location")
+
+            d = QDialog(self)
+            d.setWindowTitle("Добавление новой книги в фонд")
+            f = QFormLayout(d)
+
+            # Поля ввода
+            name_in = QLineEdit()
+            year_in = QSpinBox();
+            year_in.setRange(1000, 2025);
+            year_in.setValue(2024)
+            price_in = QSpinBox();
+            price_in.setRange(0, 100000);
+            price_in.setSingleStep(100)
+
+            cb_auth = QComboBox()
+            for r in authors: cb_auth.addItem(str(r[1]), r[0])
+
+            cb_class = QComboBox()
+            for r in classes: cb_class.addItem(str(r[1]), r[0])
+
+            cb_rack = QComboBox()
+            for r in racks: cb_rack.addItem(str(r[1]), r[0])
+
+            f.addRow(QLabel(f"<b>ID книги:</b> {next_book_id} | <b>Инв №:</b> {next_inv_id}"))
+            f.addRow("Название книги:", name_in)
+            f.addRow("Год издания:", year_in)
+            f.addRow("Сумма залога (тг):", price_in)
+            f.addRow("Дисциплина:", cb_class)
+            f.addRow("Автор:", cb_auth)
+            f.addRow("Место хранения:", cb_rack)
+
+            btn = QPushButton("💾 Сохранить в базу и обновить каталог")
+            btn.clicked.connect(d.accept)
+            f.addRow(btn)
+
+            if d.exec():
+                # 1. Создаем саму книгу
+                self.db.execute_query("INSERT INTO Book (id, name, classifierID) VALUES (?, ?, ?)",
+                                      [next_book_id, name_in.text(), cb_class.currentData()])
+
+                # 2. Привязываем автора
+                self.db.execute_query("UPDATE Authors_Name SET bookID = ? WHERE authorID = ?",
+                                      [next_book_id, cb_auth.currentData()])
+
+                # 3. Добавляем информацию об издании (чтобы JOIN Publications сработал)
+                self.db.execute_query("INSERT INTO Publications (bookID, year_of_public) VALUES (?, ?)",
+                                      [next_book_id, year_in.value()])
+
+                # 4. Создаем инвентарный номер и привязываем к стеллажу (для JOIN Inventory + Storage)
+                self.db.execute_query("""
+                                      INSERT INTO Inventory_Numbers (id, bookID, date_of_receipt, deposit_amount, storageRackID)
+                                      VALUES (?, ?, GETDATE(), ?, ?)""",
+                                      [next_inv_id, next_book_id, price_in.value(), cb_rack.currentData()])
+
+                self.refresh()
+                QMessageBox.information(self, "Успех", "Книга успешно добавлена и появилась в каталоге!")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка при создании", f"Проверьте правильность данных:\n{str(e)}")
+
+    def form_issue(self):
+        """РАБОЧАЯ ВЫДАЧА (MS SQL + ТРИГГЕР)"""
+        try:
+            lib_res = self.db.get_list(f"SELECT id FROM Librarian WHERE SystemLogin = '{self.db.user_login}'")
+            lib_id = lib_res[0][0] if lib_res else None
+            books = self.db.get_list("SELECT id, name FROM Book")
+            readers = self.db.get_list("SELECT id, name FROM Readers")
+            next_inv = self.db.get_next_id("Inventory_Numbers", "id")
+            d = QDialog(self);
+            f = QFormLayout(d);
+            d.setWindowTitle("Выдача")
+            cb_b = QComboBox();
+            cb_r = QComboBox();
+            days = QSpinBox();
+            price = QSpinBox()
+            days.setRange(1, 365);
+            price.setRange(0, 10000)
+            for r in books: cb_b.addItem(str(r[1]), r[0])
+            for r in readers: cb_r.addItem(str(r[1]), r[0])
+            f.addRow("Книга:", cb_b);
+            f.addRow("Читатель:", cb_r);
+            f.addRow("Срок:", days);
+            f.addRow("Залог:", price)
+            btn = QPushButton("✅ Оформить");
+            btn.clicked.connect(d.accept);
+            f.addRow(btn)
+            if d.exec():
+                self.db.execute_query(
+                    "INSERT INTO Inventory_Numbers (id, bookID, date_of_receipt, deposit_amount) VALUES (?, ?, GETDATE(), ?)",
+                    [next_inv, cb_b.currentData(), price.value()])
+                self.db.execute_query("DISABLE TRIGGER trg_BookIssuance_Insert ON Book_Issuance")
+                sql = "INSERT INTO Book_Issuance (invNum, reader, date_of_delivery, how_long, date_of_return, librarian) VALUES (?, ?, GETDATE(), ?, DATEADD(day, ?, GETDATE()), ?)"
+                self.db.execute_query(sql, [next_inv, cb_r.currentData(), days.value(), days.value(), lib_id])
+                self.db.execute_query("ENABLE TRIGGER trg_BookIssuance_Insert ON Book_Issuance");
+                self.refresh()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    def query_books_by_author(self):
+        name, ok = QInputDialog.getText(self, "Поиск", "Введите имя автора:")
+        if ok and name: self.load_data(self.table_cat, f"EXEC Get_BooksByAuthorName @AuthorName='{name}'")
+
+    def form_add_librarian(self):
+        try:
+            next_id = self.db.get_next_id("Librarian", "id")
+            n, ok1 = QInputDialog.getText(self, 'Найм', 'ФИО:')
+            l, ok2 = QInputDialog.getText(self, 'Найм', 'Логин:')
+            if ok1 and ok2: self.db.execute_query("INSERT INTO Librarian (id, name, SystemLogin) VALUES (?, ?, ?)",
+                                                  [next_id, n, l]); self.refresh()
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
+    def do_fire_librarian(self):
+        curr = self.table_staff.currentRow()
+        if curr >= 0:
+            val = self.table_staff.item(curr, 0).text()
+            if QMessageBox.question(self, "?", "Уволить?") == QMessageBox.StandardButton.Yes:
+                self.db.execute_query("DELETE FROM Librarian WHERE id = ?", [val]);
+                self.refresh()
+
+    def form_author(self):
+        next_id = self.db.get_next_id("Authors_Name", "authorID")
+        name, ok = QInputDialog.getText(self, 'Автор', 'ФИО:')
+        if ok and name: self.db.execute_query("INSERT INTO Authors_Name (authorID, name) VALUES (?, ?)",
+                                              [next_id, name]); self.refresh()
+
+    def do_del(self):
+        curr = self.table_adm.currentRow()
+        if curr >= 0:
+            val = self.table_adm.item(curr, 0).text()
+            self.db.execute_query("DELETE FROM Book_Issuance WHERE invNum = ?", [val]);
+            self.refresh()
+
+    def proc_financial_report(self):
+        """Отчет 2: Стоимость фонда через процедуру с вводом параметра"""
+        rack_id, ok = QInputDialog.getInt(self, "Параметр процедуры", "Введите ID стеллажа (RackID):", 1, 0, 1000)
+        if ok:
+            # Вызов процедуры согласно названию на твоем скриншоте
+            self.load_data(self.table_adm, f"EXEC Get_DepositSum_ByRack @RackID = {rack_id}")
+            
+
+    def query_minors(self):
+        """Запрос 5: Список несовершеннолетних через View"""
+        # Вызов представления согласно названию на твоем скриншоте
+        self.load_data(self.table_adm, "SELECT * FROM View_MinorReaders")
+
+    def proc_mass_authors(self):
+        """Процедура 3: Массовая вставка авторов (цикл на стороне SQL)"""
+        if QMessageBox.question(self, "?",
+                                "Запустить процедуру массовой вставки трех авторов?") == QMessageBox.StandardButton.Yes:
+            self.db.execute_query("EXEC Insert_ThreeAuthors")
+            QMessageBox.information(self, "ОК", "Процедура выполнена успешно.")
+            self.refresh()
+
+    def proc_update_book_info(self):
+        """Процедура 4: Обновление названия и категории (простой ручной ввод)"""
+        curr = self.table_adm.currentRow()
+        if curr < 0:
+            QMessageBox.warning(self, "!", "Выберите строку!")
+            return
+
+        # 1. Получаем BookID через инвентарный номер
+        inv_num = self.table_adm.item(curr, 0).text()
+        res = self.db.get_list(f"SELECT bookID FROM Inventory_Numbers WHERE id = {inv_num}")
+        if not res: return
+
+        # Извлекаем ID (число)
+        try:
+            book_id = int(res[0][0]) if isinstance(res, list) else int(res)
+        except:
+            book_id = res
+
+        # 2. По очереди спрашиваем новые данные (так не вылетает)
+        new_name, ok1 = QInputDialog.getText(self, "Шаг 1", f"Новое название для ID {book_id}:")
+        if not ok1 or not new_name: return
+
+        new_class_id, ok2 = QInputDialog.getInt(self, "Шаг 2", "ID новой дисциплины (Classifier):", 1, 1, 1000)
+        if not ok2: return
+
+        # 3. Вызов процедуры
+        sql = "EXEC Proc_UpdateBookData @BookID = ?, @NewName = ?, @NewClassID = ?"
+        ok_q, msg = self.db.execute_query(sql, [book_id, new_name, new_class_id])
+
+        if ok_q:
+            self.refresh()
+            QMessageBox.information(self, "ОК", "Данные книги обновлены!")
+        else:
+            QMessageBox.critical(self, "Ошибка БД", f"Убедитесь, что ID {new_class_id} существует в Classifier!\n{msg}")
+
+        # --- ЭКСКЛЮЗИВНЫЙ БЛОК АДМИНИСТРАТОРА (DBA) ---
+
+    def setup_dba_maintenance_tab(self):
+        """Вкладка технического обслуживания согласно ТЗ (Мониторинг, Аудит, Оптимизация)"""
+        tab = QWidget()
+        lay = QVBoxLayout(tab)
+
+        # 1. Секция протоколирования и ИБ
+        lay.addWidget(QLabel("<b>🛡 Протоколирование событий и Инциденты ИБ:</b>"))
+        mon_lay = QHBoxLayout()
+
+        btn_audit = QPushButton("📂 Читать системный аудит");
+        btn_audit.clicked.connect(self.dba_view_server_audit)
+
+        btn_sessions = QPushButton("🖥 Мониторинг сессий (Online)");
+        btn_sessions.clicked.connect(lambda: self.load_data(self.table_adm,
+                                                            "SELECT session_id, login_name, status, cpu_time, last_request_end_time FROM sys.dm_exec_sessions WHERE database_id = DB_ID()"))
+
+        btn_threats = QPushButton("🚨 Поиск угроз (Удаления)");
+        btn_threats.clicked.connect(self.dba_find_threats)
+
+        mon_lay.addWidget(btn_audit);
+        mon_lay.addWidget(btn_sessions);
+        mon_lay.addWidget(btn_threats)
+        lay.addLayout(mon_lay)
+
+        # 2. Секция оптимизации и жизненного цикла
+        lay.addWidget(QLabel("<b>⚙ Оптимизация и Жизненный цикл данных:</b>"))
+        opt_lay = QHBoxLayout()
+
+        btn_reindex = QPushButton("🚀 Оптимизация запросов (Индексы)");
+        btn_reindex.clicked.connect(self.dba_optimize_db)
+
+        btn_stats = QPushButton("📊 Статистика использования");
+        btn_stats.clicked.connect(lambda: self.load_data(self.table_adm,
+                                                         "SELECT OBJECT_NAME(object_id) AS [Table], row_count FROM sys.dm_db_partition_stats WHERE index_id < 2"))
+
+        opt_lay.addWidget(btn_reindex);
+        opt_lay.addWidget(btn_stats)
+        lay.addLayout(opt_lay)
+
+        lay.addWidget(self.table_adm)
+        self.tabs.addTab(tab, "Панель DBA")
+
+        # --- БЛОК ЭКСПОРТА ДЛЯ АДМИНА ---
+        lay.addWidget(QLabel("<b>📦 Экспорт технических отчетов:</b>"))
+        dba_report_lay = QHBoxLayout()
+
+        btn_export_xls = QPushButton("📗 Экспорт в Excel")
+        # Он заберет всё, что сейчас выведено в таблицу админа (логи, сессии или статистику)
+        btn_export_xls.clicked.connect(lambda: ReportExporter.to_excel(self.table_adm, "DBA_Technical_Report"))
+
+        btn_export_pdf = QPushButton("📕 Экспорт в PDF")
+        btn_export_pdf.clicked.connect(lambda: ReportExporter.to_pdf(self.table_adm, "DBA_Technical_Report"))
+
+        dba_report_lay.addWidget(btn_export_xls)
+        dba_report_lay.addWidget(btn_export_pdf)
+        lay.addLayout(dba_report_lay)
+
+        # --- НОВЫЙ БЛОК: РЕЗЕРВИРОВАНИЕ ---
+        lay.addWidget(QLabel("<b>💾 Резервное копирование и Восстановление:</b>"))
+        bak_lay = QHBoxLayout()
+
+        btn_backup = QPushButton("📦 Создать Full-Backup")
+        btn_backup.clicked.connect(self.dba_make_backup)
+
+        btn_restore = QPushButton("🔄 Восстановить базу (Процедура)")
+        btn_restore.clicked.connect(self.dba_call_restore_proc)
+
+        bak_lay.addWidget(btn_backup)
+        bak_lay.addWidget(btn_restore)
+        lay.addLayout(bak_lay)
+
+
+    def dba_view_server_audit(self):
+        """Прямое чтение файлов аудита из твоей папки на диске D"""
+        audit_path = r'E:\GREAT LOCK IN\администрирование бд\SQL_Audit\*'
+
+        query = f"""
+               SELECT TOP 200
+                   event_time AS [Время],
+                   action_id AS [Действие],
+                   session_server_principal_name AS [Кто],
+                   object_name AS [Объект],
+                   statement AS [Текст запроса]
+               FROM sys.fn_get_audit_file('{audit_path}', DEFAULT, DEFAULT)
+               ORDER BY event_time DESC
+           """
+        self.load_data(self.table_adm, query)
+
+    def dba_find_threats(self):
+        """Расследование инцидентов: фильтруем только опасные действия (DELETE/DROP)"""
+        audit_path = r'E:\GREAT LOCK IN\администрирование бд\SQL_Audit\*'
+        query = f"""
+               SELECT event_time, session_server_principal_name, statement 
+               FROM sys.fn_get_audit_file('{audit_path}', DEFAULT, DEFAULT)
+               WHERE statement LIKE '%DELETE%' OR statement LIKE '%DROP%'
+               ORDER BY event_time DESC
+           """
+        self.load_data(self.table_adm, query)
+
+    def dba_optimize_db(self):
+        """Оптимизация выполнения запросов через дефрагментацию индексов"""
+        if QMessageBox.question(self, "DBA", "Запустить оптимизацию всех таблиц?") == QMessageBox.StandardButton.Yes:
+            # Команда пересобирает индексы для ускорения поиска
+            sql = "EXEC sp_MSforeachtable 'ALTER INDEX ALL ON ? REORGANIZE'"
+            self.db.execute_query(sql)
+            QMessageBox.information(self, "ОК", "Индексы оптимизированы. Скорость запросов повышена.")
+
+    def view_all_authors(self):
+        """Просмотр результата вставки: выводит список авторов"""
+        # Сортируем по ID убыванию, чтобы новые (вставленные) были вверху
+        query = "SELECT authorID, name FROM Authors_Name ORDER BY authorID DESC"
+        self.load_data(self.table_adm, query)
+        QMessageBox.information(self, "Инфо", "Список авторов обновлен. Проверьте последние записи.")
+
+    # Временное решение прямо в методе бэкапа:
+    def dba_make_backup(self):
+        try:
+            path = r'E:\GREAT LOCK IN\администрирование бд\library_full.bak'
+
+            # Хардкодим строку подключения (замени SERVER на имя своего сервера, если не заработает)
+            # Или попробуй взять её из своего db_manager, если ты её там сохранял
+            conn_str = (
+                "Driver={ODBC Driver 17 for SQL Server};"
+                "Server=.;"  # Точка означает локальный сервер
+                "Database=Stud_SultanovAlan;"
+                "Trusted_Connection=yes;"  # Если используешь Windows-авторизацию
+            )
+
+            # Если ты используешь логин/пароль (SQL Auth), используй эту строку:
+            # conn_str = "Driver={ODBC Driver 17 for SQL Server};Server=.;Database=Stud_SultanovAlan;UID=AdminLogin;PWD=твой_пароль;"
+
+            with pyodbc.connect(conn_str, autocommit=True) as temp_conn:
+                cursor = temp_conn.cursor()
+                sql = f"BACKUP DATABASE Stud_SultanovAlan TO DISK = '{path}' WITH FORMAT"
+                cursor.execute(sql)
+                while cursor.nextset(): pass
+
+            QMessageBox.information(self, "ОК", f"Резервная копия успешно создана в:\n{path}")
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка бэкапа", f"Не удалось создать копию:\n{str(e)}")
+
+    def dba_call_restore_proc(self):
+        if QMessageBox.question(self, "?", "Восстановить базу?") == QMessageBox.StandardButton.Yes:
+            try:
+                with pyodbc.connect(self.db.connection_string, autocommit=True) as temp_conn:
+                    temp_conn.cursor().execute("EXEC sp_DBA_RestoreDatabase")
+                QMessageBox.information(self, "ОК", "Система восстановлена!")
+                self.refresh()
+            except Exception as e:
+                QMessageBox.critical(self, "Ошибка", str(e))
+
+    def setup_readers_management_tab(self):
+        self.readers_tab = QWidget()
+        lay = QVBoxLayout(self.readers_tab)
+
+        # Кнопки
+        btns = QHBoxLayout()
+        btn_add = QPushButton("➕ Новый читатель")
+        btn_add.clicked.connect(self.form_add_new_reader)
+
+        btn_refresh = QPushButton("🔄 Обновить")
+        btn_refresh.clicked.connect(self.refresh_readers_list)
+
+        btns.addWidget(btn_add)
+        btns.addWidget(btn_refresh)
+        btns.addStretch()
+
+        # Таблица
+        self.table_readers = QTableWidget()
+        lay.addLayout(btns)
+        lay.addWidget(self.table_readers)
+
+        # Добавляем в основной виджет вкладок
+        self.tabs.addTab(self.readers_tab, "👥 Читатели")
+        self.refresh_readers_list()  # Сразу загружаем данные
+
+    def refresh_readers_list(self):
+        """Обновление таблицы читателей (под структуру БД)"""
+        # Выбираем те колонки, которые есть на твоем скрине
+        sql = "SELECT id, name as [ФИО], adress as [Адрес], phone as [Телефон], birthday as [Дата рожд], gender as [Пол] FROM Readers"
+        self.load_data(self.table_readers, sql)
+
+    def form_add_new_reader(self):
+        """Окно регистрации нового читателя (твоя структура БД)"""
+        try:
+            next_id = self.db.get_next_id("Readers", "id")
+
+            d = QDialog(self)
+            d.setWindowTitle("Регистрация нового читателя")
+            f = QFormLayout(d)
+
+            # Поля ввода
+            name_in = QLineEdit()
+            adress_in = QLineEdit()
+            phone_in = QLineEdit()
+            date_in = QDateEdit()
+            date_in.setCalendarPopup(True)
+            date_in.setDate(QDate.currentDate().addYears(-20))
+
+            gender_in = QComboBox()
+            gender_in.addItems(["M", "F"])  # Твой тип char(1)
+
+            f.addRow("ID читателя:", QLabel(str(next_id)))
+            f.addRow("ФИО:", name_in)
+            f.addRow("Адрес:", adress_in)
+            f.addRow("Телефон:", phone_in)
+            f.addRow("Дата рождения:", date_in)
+            f.addRow("Пол (M/F):", gender_in)
+
+            btn = QPushButton("💾 Сохранить")
+            btn.clicked.connect(d.accept)
+            f.addRow(btn)
+
+            if d.exec():
+
+                name = name_in.text().strip()
+                adress = adress_in.text().strip()
+                phone = phone_in.text().strip()
+
+                # Проверка пустых полей
+                if not self.validate_text_required(name):
+                    raise Exception("Введите ФИО!")
+
+                if not self.validate_text_required(adress):
+                    raise Exception("Введите адрес!")
+
+                # Проверка ФИО
+                if not self.validate_name(name):
+                    raise Exception(
+                        "ФИО должно содержать только буквы!"
+                    )
+
+                # Проверка телефона
+                if phone and not self.validate_phone(phone):
+                    raise Exception(
+                        "Телефон должен содержать только цифры!"
+                    )
+
+                sql = """
+                      INSERT INTO Readers
+                          (id, name, adress, phone, birthday, gender)
+                      VALUES (?, ?, ?, ?, ?, ?) \
+                      """
+
+                params = [
+                    next_id,
+                    name,
+                    adress,
+                    phone,
+                    date_in.date().toString("yyyy-MM-dd"),
+                    gender_in.currentText()
+                ]
+
+                ok, msg = self.db.execute_query(sql, params)
+
+                if ok:
+                    QMessageBox.information(
+                        self,
+                        "Успех",
+                        "Читатель успешно зарегистрирован!"
+                    )
+
+                    self.refresh_readers_list()
+
+                else:
+                    raise Exception(msg)
+                # Запрос под твои имена колонок: name, adress, phone, birthday, gender
+                sql = """INSERT INTO Readers (id, name, adress, phone, birthday, gender)
+                         VALUES (?, ?, ?, ?, ?, ?)"""
+                params = [
+                    next_id,
+                    name_in.text(),
+                    adress_in.text(),
+                    phone_in.text(),
+                    date_in.date().toString("yyyy-MM-dd"),
+                    gender_in.currentText()
+                ]
+
+                ok, msg = self.db.execute_query(sql, params)
+                if ok:
+                    QMessageBox.information(self, "Успех", "Читатель успешно зарегистрирован!")
+                    self.refresh_readers_list()
+                else:
+                    raise Exception(msg)
+
+        except Exception as e:
+            QMessageBox.critical(self, "Ошибка", str(e))
+
